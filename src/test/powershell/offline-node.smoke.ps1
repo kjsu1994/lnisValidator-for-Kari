@@ -289,6 +289,15 @@ try {
         throw 'Selected proxy replacement lost the original forwarding target during rollback.'
     }
     $script:rules=''
+    function Get-NetFirewallHyperVRule { param($Name,$ErrorAction) }
+    function New-NetFirewallHyperVRule { param($Name,$DisplayName,$Direction,$Action,$VMCreatorId,$Protocol,$LocalPorts) $script:hyperPort=$LocalPorts }
+    $network | Add-Member networkingMode mirrored
+    $network.loopback=$null
+    $script:rules='0.0.0.0 18088 ::1 18088'
+    $script:networkCalls=@()
+    Set-NodeNetwork $network
+    if ($script:hyperPort -ne 18088 -or ($script:networkCalls -match 'portproxy add') -or !($script:networkCalls -match 'portproxy delete v4tov6')) { throw 'Mirrored mode failed to migrate the owned proxy.' }
+    Write-Host 'PASS: mirrored mode removes owned NAT proxy and opens the service port'
     Write-Host 'PASS: matching Windows/WSL port, stable loopback proxy and foreign-rule isolation'
 
     $script:hostConfig='{"services":{"node":{"network_mode":"host","environment":{}}}}'
@@ -309,6 +318,7 @@ try {
     function Invoke-NodeWsl {
         param($Context,[string[]]$Arguments)
         $script:commands.Add(($Arguments -join ' '))
+        if ($Arguments -contains 'wget') { return '{"status":"UP"}' }
         if ($Arguments -contains 'inspect') { return $script:inspectedImageId }
         if ($Arguments -contains 'info') { return 'linux' }
         if ($Arguments -contains 'config') { return '{"services":{"node":{"ports":[{"published":"18088","target":18088,"protocol":"tcp"}],"environment":{"SERVER_PORT":"18088"}}}}' }
@@ -382,13 +392,15 @@ Set-Content (Join-Path $fixtureData 'stopped-marker') 'stopped'
         param($Context,$Arguments)
         if (!$script:installWslHeld) { throw 'Installer used Docker before keeping WSL running.' }
         $script:installCalls+=($Arguments -join ' ')
+        if ($script:missingOldImage -and $Arguments -contains 'inspect') { throw 'No such image' }
     }
     function Get-NodeReady { param($Context) return 'http://127.0.0.1:18088' }
-    function Wait-NodeReady { param($Context) return 'http://127.0.0.1:18088' }
+    function Wait-NodeReady { param($Context) }
+    function Get-NodeForwardTarget { param($Context) return 'http://172.24.182.165:18088' }
     function Assert-NodeIdle { param($Context,$Url) $script:idleChecks++ }
     function wsl.exe { $global:LASTEXITCODE=0;return 'LNIS-Runtime' }
     function Get-NodeWslRuntimes {
-        return @([pscustomobject]@{Name='Ubuntu';Location=(Join-Path $Destination 'runtime');Version=2;IsDefault=$true})
+        return @([pscustomobject]@{Name='Ubuntu';Location=(Join-Path $Destination 'runtime');Version=2;IsDefault=$true}, [pscustomobject]@{Name='LNIS-Test';Location='fixture';Version=2;IsDefault=$false})
     }
     function Invoke-RestMethod { param($Uri,$TimeoutSec) return @{online=$true;role='sender'} }
     $script:fakeShell=New-Object PSObject
@@ -425,6 +437,12 @@ Set-Content (Join-Path $fixtureData 'stopped-marker') 'stopped'
     if (Test-Path (Join-Path $Destination 'app')) { throw 'Fresh installation is not flat.' }
     Set-Content (Join-Path $script:installData 'DB\marker') 'original-db'
     $Configuration=$null
+    $script:missingOldImage=$true
+    $script:installCalls=@()
+    Assert-Throws { & ([ScriptBlock]::Create($transaction)) }
+    if ($script:installCalls | Where-Object { $_ -match 'docker load --input' }) { throw 'Upgrade changed the image before checking rollback.' }
+    if ((Get-Content (Join-Path $script:installData 'DB\marker')) -ne 'original-db') { throw 'Missing image check changed the DB.' }
+    $script:missingOldImage=$false
     & ([ScriptBlock]::Create($transaction))
     if ($script:idleChecks -ne 1) { throw 'Upgrade did not check active work.' }
     if ((Get-Content (Join-Path $script:installData 'DB\marker')) -ne 'original-db') { throw 'Upgrade changed the DB.' }

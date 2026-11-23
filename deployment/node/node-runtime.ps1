@@ -154,8 +154,8 @@ function Enter-NodeLock($Context) {
     return $mutex
 }
 
-function Get-NodeReady($Context) {
-    foreach ($hostName in @('[::1]', '127.0.0.1')) {
+function Get-NodeReady($Context, [string[]]$Hosts = @('[::1]', '127.0.0.1')) {
+    foreach ($hostName in $Hosts) {
         $url = 'http://' + $hostName + ':' + $Context.Port
         try {
             $node = Invoke-RestMethod "$url/lnis/api/v1/node" -TimeoutSec 2
@@ -168,14 +168,46 @@ function Get-NodeReady($Context) {
     return $null
 }
 
+function Get-NodeWslReady($Context) {
+    $addresses = (Invoke-NodeWsl $Context @('hostname','-I')) -join ' '
+    $ipv4 = @($addresses -split '\s+' | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
+    if ($ipv4.Count) { return Get-NodeReady $Context $ipv4 }
+}
+
+
+function Test-NodeMirrored($Context) {
+    # Older NAT-only WSL versions do not ship wslinfo.
+    $mode = Invoke-NodeWsl $Context @('sh','-c','if command -v wslinfo >/dev/null; then wslinfo --networking-mode; else echo nat; fi')
+    return (($mode -join '').Trim() -eq 'mirrored')
+}
+
+function Get-NodeForwardTarget($Context) {
+    $url = Get-NodeWslReady $Context
+    if (!$url) { $url = Get-NodeReady $Context @('[::1]') }
+    if (!$url) { throw "Windows에서 WSL 서비스로 전달할 주소를 찾지 못했습니다 (포트 $($Context.Port))." }
+    return $url
+}
+
+
 function Wait-NodeReady($Context) {
+    $compose = @('docker') + (Get-NodeCompose $Context)
+    $base = "http://127.0.0.1:$($Context.Port)/lnis/api/v1"
     $deadline = (Get-Date).AddMinutes(3)
+    $lastError = ''
     do {
-        $url = Get-NodeReady $Context
-        if ($url) { return $url }
+        try {
+            $health = (Invoke-NodeWsl $Context ($compose + @('exec','-T','node','wget','-T','2','-qO-',"$base/actuator/health/readiness"))) -join ''
+            if (($health | ConvertFrom-Json).status -eq 'UP') { return }
+        } catch { $lastError = $_.Exception.Message }
         Start-Sleep -Seconds 2
     } while ((Get-Date) -lt $deadline)
-    throw "서비스 준비를 확인하지 못했습니다. Windows 내부 접속 포트 $($Context.Port)와 Docker 로그를 확인하세요."
+    if ($lastError) { Write-Warning $lastError }
+    foreach ($args in @(@('ps','-a'), @('logs','--no-color','--tail','30','node'))) {
+        try { Invoke-NodeWsl $Context ($compose + $args) | Out-Host }
+        catch { Write-Warning $_.Exception.Message }
+    }
+    throw "WSL 컨테이너 내부에서 서비스 준비를 확인하지 못했습니다 (포트 $($Context.Port))."
+
 }
 
 function Assert-NodeIdle($Context, [string]$Url) {
@@ -356,8 +388,16 @@ function Set-NodeNetwork($Config, [switch]$ReplacePortProxy) {
     $port = [int]$Config.port
     $bridgePort = [int]$Config.bridgePort
     if ($port -lt 1 -or $port -gt 65535 -or $bridgePort -lt 1 -or $bridgePort -gt 65535) { throw '서비스 및 중계 포트는 1~65535여야 합니다.' }
-    if ($Config.loopback -notin @('127.0.0.1','::1')) { throw '포트 전달 대상은 Windows 내부 주소만 허용합니다.' }
-    $mode = if ($Config.loopback -eq '::1') { 'v4tov6' } else { 'v4tov4' }
+    $mirrored = $Config.networkingMode -eq 'mirrored'
+    $targetIp = $null
+    if (!$mirrored -and (![Net.IPAddress]::TryParse([string]$Config.loopback, [ref]$targetIp) -or
+        ($targetIp.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -and $targetIp -ne [Net.IPAddress]::IPv6Loopback))) {
+        throw '포트 전달 대상 주소가 올바르지 않습니다.'
+    }
+    if ($Config.listenAddress -eq '0.0.0.0' -and $targetIp -eq [Net.IPAddress]::Loopback) {
+        throw '8088/8089와 같은 서비스 포트를 IPv4 루프백의 동일 포트로 전달할 수 없습니다.'
+    }
+    $mode = if ($mirrored) { 'mirrored' } elseif ($Config.loopback -eq '::1') { 'v4tov6' } else { 'v4tov4' }
     $record = $Config.record
     $owned = if (Test-Path -LiteralPath $record) { Get-Content -Raw -LiteralPath $record -Encoding UTF8 | ConvertFrom-Json } else { $null }
     $rules = @(& netsh.exe interface portproxy show all)
@@ -379,15 +419,19 @@ function Set-NodeNetwork($Config, [switch]$ReplacePortProxy) {
         if ($foreign.Count) { throw '같은 포트의 다른 전달 규칙이 있습니다. 다른 서비스 포트를 선택하세요.' }
     }
     $oldRule = @()
-    if ($owned) {
+    if ($owned -and $owned.mode -ne 'mirrored') {
         $oldRule = @($rules | Where-Object { $_ -match ('^\s*' + [regex]::Escape($owned.listenAddress) + '\s+' + [int]$owned.port + '\s+') })
         if ($oldRule.Count -and $oldRule[0] -notmatch ('\s' + [regex]::Escape($owned.loopback) + '\s+' + [int]$owned.port + '\s*$')) {
             throw '다른 프로그램이 포트 전달 규칙을 변경했습니다.'
         }
     }
+    if ($owned -and $owned.mode -eq 'mirrored' -and $existing.Count -and !$conflicts.Count) {
+        throw '기존 전달 규칙이 설치 기록과 달라 변경할 수 없습니다.'
+    }
     Set-Service iphlpsvc -StartupType Automatic
     Start-Service iphlpsvc
     $added = $false
+    $hyperAdded = $false
     $removed = @()
     try {
         $replace = @($conflicts)
@@ -398,9 +442,17 @@ function Set-NodeNetwork($Config, [switch]$ReplacePortProxy) {
             $removed += $rule
             if ($rule.line) { Write-Host ("선택한 포트의 기존 전달 규칙 정리: " + $rule.listenAddress + ":" + $rule.port) }
         }
-        & netsh.exe interface portproxy add $mode "listenaddress=$($Config.listenAddress)" "listenport=$port" "connectaddress=$($Config.loopback)" "connectport=$port" | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'Windows → WSL 포트 전달 설정에 실패했습니다.' }
-        $added = $true
+        $hyperName = "IMT-DTN-WSL-$port"
+        if ($mirrored) {
+            if (!(Get-NetFirewallHyperVRule -Name $hyperName -ErrorAction SilentlyContinue)) {
+                New-NetFirewallHyperVRule -Name $hyperName -DisplayName 'IMT DTN WSL service' -Direction Inbound -Action Allow -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts $port | Out-Null
+                $hyperAdded = $true
+            }
+        } else {
+            & netsh.exe interface portproxy add $mode "listenaddress=$($Config.listenAddress)" "listenport=$port" "connectaddress=$($Config.loopback)" "connectport=$port" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Windows → WSL 포트 전달 설정에 실패했습니다.' }
+            $added = $true
+        }
         foreach ($name in @(('IMT-DTN-Service-' + $port),('IMT-DTN-COM-' + $port))) {
             Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue | Remove-NetFirewallRule
         }
@@ -411,10 +463,21 @@ function Set-NodeNetwork($Config, [switch]$ReplacePortProxy) {
                 Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue | Remove-NetFirewallRule
             }
         }
+        if ($Config.publicUrl) {
+            $node = Invoke-RestMethod ($Config.publicUrl + '/lnis/api/v1/node') -TimeoutSec 5
+            if (!$node.online -or $node.role -ine $Config.role) {
+                throw "포트 전달 적용 후 서비스에 연결하지 못했습니다: $($Config.publicUrl)"
+            }
+        }
+
+        if ($owned -and $owned.mode -eq 'mirrored' -and (!$mirrored -or [int]$owned.port -ne $port)) {
+            Remove-NetFirewallHyperVRule -Name ("IMT-DTN-WSL-" + $owned.port) -ErrorAction SilentlyContinue
+        }
         $Config | Add-Member -NotePropertyName mode -NotePropertyValue $mode -Force
         $Config | ConvertTo-Json | Set-Content -LiteralPath $record -Encoding UTF8
     } catch {
         $failure = $_
+        if ($hyperAdded) { Remove-NetFirewallHyperVRule -Name $hyperName -ErrorAction SilentlyContinue }
         if ($added) {
             & netsh.exe interface portproxy delete $mode "listenaddress=$($Config.listenAddress)" "listenport=$port" | Out-Null
         }
@@ -436,6 +499,7 @@ function Update-NodeAddress($Context) {
     $url = 'http://' + $address + ':' + $Context.Port
     if ($url -ne $Context.Settings.LNIS_NODE_BASE_URL) {
         $ready = Get-NodeReady $Context
+        if (!$ready) { try { $ready = Get-NodeWslReady $Context } catch {} }
         if ($ready) { Assert-NodeIdle $Context $ready }
         $Context.Settings.LNIS_NODE_BASE_URL = $url
         Write-InstallEnvironment $Context.EnvFile $Context.EnvFile $Context.Settings
@@ -455,19 +519,22 @@ function Get-NodeBridgePort($Context) {
     return 18765
 }
 
-function Repair-NodeNetwork($Context, [string]$LocalUrl) {
+function Repair-NodeNetwork($Context) {
     $record = Join-Path $Context.Data 'network.json'
-    $loopback = ([Uri]$LocalUrl).Host.Trim('[',']')
+
+    $publicHost = ([Uri]$Context.Settings.LNIS_NODE_BASE_URL).Host
+    $mirrored = Test-NodeMirrored $Context
+    if ($mirrored) { $publicHost = '127.0.0.1' }
     $saved = if (Test-Path -LiteralPath $record) { Get-Content -LiteralPath $record -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
-    if ($saved -and $saved.listenAddress -eq '0.0.0.0' -and [int]$saved.port -eq $Context.Port -and $saved.loopback -eq $loopback) {
-        try {
-            $node = Invoke-RestMethod ($Context.Settings.LNIS_NODE_BASE_URL + '/lnis/api/v1/node') -TimeoutSec 3
-            if ($node.online -and $node.role -ieq $Context.Settings.LNIS_NODE_ROLE) { return }
-        } catch {}
-    }
+    if ($saved -and [int]$saved.port -eq $Context.Port -and ($mirrored -eq ($saved.mode -eq 'mirrored')) -and (Get-NodeReady $Context @($publicHost))) { return }
+
+    $loopback = if (!$mirrored) { ([Uri](Get-NodeForwardTarget $Context)).Host.Trim('[',']') }
+
     $javaDirectory = if (Test-Path -LiteralPath (Join-Path $Context.App 'jre\bin\java.exe')) { 'jre' } else { 'runtime' }
     $configuration = @{
+        networkingMode=if ($mirrored) { 'mirrored' } else { 'nat' }
         listenAddress='0.0.0.0';port=$Context.Port;loopback=$loopback;record=$record
+        publicUrl=("http://" + $publicHost + ":" + $Context.Port); role=$Context.Settings.LNIS_NODE_ROLE
         bridgePort=(Get-NodeBridgePort $Context)
         java=(Join-Path $Context.App ($javaDirectory + '\bin\java.exe'))
     }
@@ -476,8 +543,16 @@ function Repair-NodeNetwork($Context, [string]$LocalUrl) {
         $configuration | ConvertTo-Json | Set-Content -LiteralPath $file -Encoding UTF8
         $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + (Join-Path $Context.App 'start.ps1') + '"'),'-NetworkSetup',('"' + $file + '"'))
         $child = Start-Process powershell.exe -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden -Wait -PassThru
-        if ($child.ExitCode -ne 0) { throw 'Windows 접속 포트 설정을 완료하지 못했습니다. 관리자 승인과 포트 사용 상태를 확인하세요.' }
+        if ($child.ExitCode -ne 0) {
+            if (Test-Path -LiteralPath "$file.error") { throw (Get-Content -LiteralPath "$file.error" -Raw -Encoding UTF8) }
+            throw "Windows 접속 포트 설정 실패 (종료 코드 $($child.ExitCode))"
+        }
+        if (!(Get-NodeReady $Context @($publicHost))) {
+            throw "포트 전달 적용 후 서비스에 연결하지 못했습니다: $($Context.Settings.LNIS_NODE_BASE_URL)"
+        }
     } finally {
-        if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
+        foreach ($temporary in @($file, "$file.error")) {
+            if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+        }
     }
 }

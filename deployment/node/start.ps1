@@ -3,7 +3,12 @@ param([switch]$NoBrowser, [string]$NetworkSetup, [switch]$SkipNetworkSetup)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'node-runtime.ps1')
 if ($NetworkSetup) {
-    Set-NodeNetwork (Get-Content -LiteralPath $NetworkSetup -Raw -Encoding UTF8 | ConvertFrom-Json)
+    try {
+        Set-NodeNetwork (Get-Content -LiteralPath $NetworkSetup -Raw -Encoding UTF8 | ConvertFrom-Json)
+    } catch {
+        $_.Exception.Message | Set-Content -LiteralPath "$NetworkSetup.error" -Encoding UTF8
+        throw
+    }
     exit 0
 }
 $context = Get-NodeContext $PSScriptRoot
@@ -49,6 +54,7 @@ try {
                 }
             } finally { $archive.Dispose() }
             $runningUrl = Get-NodeReady $context
+            if (!$runningUrl) { try { $runningUrl = Get-NodeWslReady $context } catch {} }
             if ($runningUrl) { Assert-NodeIdle $context $runningUrl }
             Write-Host '변경된 lnis.jar를 적용합니다.'
         }
@@ -59,21 +65,21 @@ try {
     $up = @('up','-d','--no-build','--pull','never')
     if ($jarChanged) { $up += '--force-recreate' }
     Invoke-NodeWsl $context (@('docker') + $compose + $up) | Out-Host
-    $url = Wait-NodeReady $context
+    Wait-NodeReady $context
     if ($jarChanged) {
         $release | Add-Member -NotePropertyName appliedJarSha256 -NotePropertyValue $jarHash -Force
         $release | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $context.App 'release.json') -Encoding UTF8
     }
     $browserUrl = $context.Settings.LNIS_NODE_BASE_URL
-    if (!$browserUrl) { $browserUrl = $url }
+    if (!$browserUrl) { $browserUrl = "http://localhost:$($context.Port)" }
     Write-Host ("서비스 실행 완료: " + $context.Settings.LNIS_NODE_ROLE + " / $browserUrl")
     if (!$gnssReady) { Write-Warning '파일 기반 시험은 사용할 수 있습니다. GNSS 장비 수집은 중계 상태를 확인하세요.' }
-    if ($context.Installed -and !$SkipNetworkSetup) { Repair-NodeNetwork $context $url }
+    if ($context.Installed -and !$SkipNetworkSetup) { Repair-NodeNetwork $context }
     if ($context.Installed) {
         try {
             $public = Invoke-RestMethod ($context.Settings.LNIS_NODE_BASE_URL + '/lnis/api/v1/node') -TimeoutSec 3
             if (!$public.online -or $public.role -ine $context.Settings.LNIS_NODE_ROLE) { throw '잘못된 응답' }
-        } catch { Write-Warning "PC 주소·포트 접속 실패: $($context.Settings.LNIS_NODE_BASE_URL). INSTALL.cmd의 네트워크 설정을 확인하세요." }
+        } catch { if ((Test-NodeMirrored $context) -and (Get-NodeReady $context @('127.0.0.1'))) { $browserUrl = "http://127.0.0.1:$($context.Port)" } else { Write-Warning "PC 주소·포트 접속 실패: $($context.Settings.LNIS_NODE_BASE_URL). INSTALL.cmd의 네트워크 설정을 확인하세요." } }
     }
     if (!$NoBrowser) { Start-Process $browserUrl }
 } catch {

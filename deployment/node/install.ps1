@@ -293,18 +293,24 @@ try {
         $oldContext = Get-NodeContext $layout.App
         if ($oldContext.Data -ine $layout.Data) { throw '기존 설치의 데이터 경로가 다릅니다. 원래 설치 위치를 확인하세요.' }
         if ($oldContext.Settings.LNIS_NODE_ROLE -ine $values.LNIS_NODE_ROLE) { throw '기존 DB의 송신·수신 역할은 변경할 수 없습니다.' }
+        if (!@(Get-NodeWslRuntimes | Where-Object Name -eq $oldContext.Distribution).Count) {
+            throw "기존 설치를 복원하는 데 필요한 WSL 배포판이 없습니다: $($oldContext.Distribution)"
+        }
+        Start-NodeKeepAlive $oldContext | Out-Null
+        Wait-NodeDocker $oldContext
+        $oldImage = $oldContext.Settings.LNIS_NODE_IMAGE
+        if (!$oldImage) { $oldImage = 'lnis-node:local' }
+        try { Invoke-NodeWsl $oldContext @('docker','image','inspect',$oldImage,'--format','{{.Id}}') | Out-Null }
+        catch { throw "기존 설치 복원에 필요한 Docker 이미지를 확인할 수 없습니다: $oldImage. $($_.Exception.Message)" }
         $url = Get-NodeReady $oldContext
+        if (!$url) { try { $url = Get-NodeWslReady $oldContext } catch {} }
         if ($url) {
             Assert-NodeIdle $oldContext $url
             & (Join-Path $layout.App 'stop.ps1')
         } else {
-            if (@(Get-NodeWslRuntimes | Where-Object Name -eq $oldContext.Distribution).Count) {
-                Start-NodeKeepAlive $oldContext | Out-Null
-                Wait-NodeDocker $oldContext
-                $filter = if ($oldContext.Settings.LNIS_COMPOSE_PROJECT) { 'label=com.docker.compose.project=' + $oldContext.Settings.LNIS_COMPOSE_PROJECT } else { 'label=com.docker.compose.project.working_dir=' + $oldContext.Linux }
-                if (Invoke-NodeWsl $oldContext @('docker','ps','--quiet','--filter',$filter)) {
-                    throw '기존 서비스의 상태를 확인할 수 없습니다. 시험 상태와 로그를 확인한 뒤 다시 설치하세요.'
-                }
+            $filter = if ($oldContext.Settings.LNIS_COMPOSE_PROJECT) { 'label=com.docker.compose.project=' + $oldContext.Settings.LNIS_COMPOSE_PROJECT } else { 'label=com.docker.compose.project.working_dir=' + $oldContext.Linux }
+            if (Invoke-NodeWsl $oldContext @('docker','ps','--quiet','--filter',$filter)) {
+                throw '기존 서비스의 상태를 확인할 수 없습니다. 시험 상태와 로그를 확인한 뒤 다시 설치하세요.'
             }
             & (Join-Path $layout.App 'stop-serial-bridge.ps1') -DataDirectory $oldContext.Data
             Stop-NodeKeepAlive $oldContext
@@ -366,21 +372,24 @@ try {
     & (Join-Path $app 'start.ps1') -NoBrowser -SkipNetworkSetup
     $context = Get-NodeContext $app
     $values.LNIS_NODE_BASE_URL = $context.Settings.LNIS_NODE_BASE_URL
-    $localUrl = Wait-NodeReady $context
+    Set-InstallStage '[6/7] Windows·WSL 접속 포트 적용'
+    $mirrored = Test-NodeMirrored $context
+    $target = if (!$mirrored) { ([Uri](Get-NodeForwardTarget $context)).Host.Trim('[',']') }
     $javaDirectory = if (Test-Path -LiteralPath (Join-Path $app 'jre\bin\java.exe')) { 'jre' } else { 'runtime' }
     $network = @{
         listenAddress='0.0.0.0'; port=$context.Port
-        loopback=([Uri]$localUrl).Host.Trim('[',']'); record=(Join-Path $data 'network.json')
+        networkingMode=if ($mirrored) { 'mirrored' } else { 'nat' }
+        loopback=$target; record=(Join-Path $data 'network.json')
         bridgePort=(Get-NodeBridgePort $context)
         java=(Join-Path $app ($javaDirectory + '\bin\java.exe'))
     }
     $networkFile = Join-Path $work 'network-install.json'
     $network | ConvertTo-Json | Set-Content -LiteralPath $networkFile -Encoding UTF8
-    Set-InstallStage '[6/7] Windows·WSL 접속 포트 적용'
     $networkArgs = @('-NetworkSetup',('"' + $networkFile + '"'))
     if ($ReplacePortProxy) { $networkArgs += '-ReplacePortProxy' }
     Invoke-InstallerAdmin $networkArgs
-    $public = Invoke-RestMethod ($values.LNIS_NODE_BASE_URL + '/lnis/api/v1/node') -TimeoutSec 5
+    $checkUrl = if ($mirrored) { "http://127.0.0.1:$($context.Port)" } else { $values.LNIS_NODE_BASE_URL }
+    $public = Invoke-RestMethod ($checkUrl + '/lnis/api/v1/node') -TimeoutSec 5
     if (!$public.online -or $public.role -ine $values.LNIS_NODE_ROLE) { throw 'Windows PC 주소와 WSL 서비스 연결을 확인하지 못했습니다.' }
     Set-InstallStage '[7/7] 바탕화면 바로가기 생성'
     $shell = New-Object -ComObject WScript.Shell
@@ -406,7 +415,7 @@ try {
         if (!(Get-ChildItem -LiteralPath $layout.Data -Force | Select-Object -First 1)) { Remove-Item -LiteralPath $layout.Data -Force }
     }
     Write-Host '설치 완료. 설치 폴더의 START.cmd 또는 바탕화면 바로가기로 실행하세요.'
-    if (!$NoBrowser) { Start-Process $values.LNIS_NODE_BASE_URL }
+    if (!$NoBrowser) { Start-Process $checkUrl }
 } catch {
     $failure = $_
     try {
