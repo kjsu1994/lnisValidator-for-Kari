@@ -39,6 +39,10 @@ public class DtnJob implements DtnRepository.SummaryView {
     @Column(length = 64)
     private String pvtHistoryKey;
 
+    /** 수신 파일 검증과 RF 계산 후 확정한 회차별 비교 기준. */
+    @Column(length = 1024)
+    private String iqHistoryJson;
+
     private String testType;
     private String senderMode;
     private String receiverMode;

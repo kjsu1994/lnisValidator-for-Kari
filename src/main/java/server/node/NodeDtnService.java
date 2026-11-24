@@ -356,7 +356,9 @@ public class NodeDtnService implements DtnNodeLink {
                 || !registration.getReceiverAgentId().equals(existing.getReceiverAgentId())) {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "이미 등록된 시험 내용과 다릅니다.");
         }
-        if (!java.util.Objects.equals(existing.getPvtHistoryKey(), registration.getPvtHistoryKey())) {
+        // I/Q 이력 키는 수신 파일을 검증한 뒤 수신부에서만 부여한다.
+        if (!"IQ_SAMPLE".equals(existing.getTestType())
+                && !java.util.Objects.equals(existing.getPvtHistoryKey(), registration.getPvtHistoryKey())) {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "이미 등록된 시험의 누적 묶음과 다릅니다.");
         }
         if (conflicts(existing.getTestType(), registration.getTestType())

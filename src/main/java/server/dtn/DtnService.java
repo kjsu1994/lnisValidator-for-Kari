@@ -139,7 +139,28 @@ public class DtnService {
 
     public record PvtHistoryItem(UUID testId, String state, String senderMode, String receiverMode,
             Instant startedAt, Instant receivedAt, Double delaySeconds, String clockWarning,
-            String availability, double[] ecefMeters) {}
+            String availability, double[] ecefMeters, double[] rfReferenceEcefMeters,
+            Double clockDifferenceSeconds) {}
+
+    record IqHistoryBasis(double[] baseline, Double delaySeconds, Double clockDifferenceSeconds) {}
+
+    void assignIqHistory(DtnJob job, String fileHash, IqReceiver.Result decoded) throws java.io.IOException {
+        if (decoded.rfBaselinePvt().size() != 1 || decoded.delayEvidence() == null) return;
+        var evidence = decoded.delayEvidence();
+        var baseline = decoded.rfBaselinePvt().getFirst();
+        double[] origin = baseline.isPositionValid() && finitePosition(baseline.getEcefMeters())
+                && evidence.error() == null && evidence.delaySeconds() >= 0 ? baseline.getEcefMeters() : null;
+        Double bias = null;
+        if (origin != null && decoded.pvt().size() == 1) {
+            Double before = baseline.getReceiverClockBiasSeconds();
+            Double after = decoded.pvt().getFirst().getReceiverClockBiasSeconds();
+            if (before != null && after != null && Double.isFinite(after - before)) bias = after - before;
+        }
+        byte[] identity = objectMapper.writeValueAsBytes(Arrays.asList(IqReceiver.RF_METHOD,
+                fileHash.toLowerCase(java.util.Locale.ROOT), job.getSenderAgentId(), job.getReceiverAgentId()));
+        job.setPvtHistoryKey(server.common.Hashing.hex(server.common.Hashing.sha256Digest().digest(identity)));
+        job.setIqHistoryJson(objectMapper.writeValueAsString(new IqHistoryBasis(origin, evidence.delaySeconds(), bias)));
+    }
 
     public record PvtHistory(String historyKey, String testType, JsonNode selectedEpoch,
             double[] referenceEcefMeters, int total, int waiting, int unavailable,
@@ -156,7 +177,9 @@ public class DtnService {
         }
         var rows = dtnRepository.findPvtHistory(key);
         double[] origin = null;
+        boolean iqHistory = "IQ_SAMPLE".equals(context.getTestType());
         for (var row : rows) {
+            if (iqHistory) break;
             if ("COMPLETE".equals(row.getReferenceStatus())) {
                 origin = historyPosition(row.getReferenceJson());
                 if (origin != null) break;
@@ -165,17 +188,19 @@ public class DtnService {
         var trials = new ArrayList<PvtHistoryItem>();
         int waiting = 0, unavailable = 0;
         for (var row : rows) {
-            double[] reference = historyPosition(row.getReferenceJson());
+            IqHistoryBasis rf = iqHistory && row.getIqHistoryJson() != null
+                    ? objectMapper.readValue(row.getIqHistoryJson(), IqHistoryBasis.class) : null;
+            double[] reference = iqHistory ? (rf == null ? null : rf.baseline()) : historyPosition(row.getReferenceJson());
             double[] received = historyPosition(row.getReceiverJson());
             String availability;
             if (List.of("FAILED", "CANCELLED").contains(Objects.toString(row.getState(), ""))) {
                 availability = row.getState();
-            } else if (ACTIVE.contains(row.getState()) || "WAITING".equals(row.getReferenceStatus())) {
+            } else if (ACTIVE.contains(row.getState()) || (!iqHistory && "WAITING".equals(row.getReferenceStatus()))) {
                 availability = "WAITING";
                 waiting++;
-            } else if (!"COMPLETE".equals(row.getReferenceStatus()) || received == null || reference == null) {
+            } else if ((!iqHistory && !"COMPLETE".equals(row.getReferenceStatus())) || received == null || reference == null) {
                 availability = "UNAVAILABLE";
-            } else if (!Arrays.equals(origin, reference)) {
+            } else if (!iqHistory && !Arrays.equals(origin, reference)) {
                 availability = "REFERENCE_MISMATCH";
             } else {
                 availability = "AVAILABLE";
@@ -187,8 +212,9 @@ public class DtnService {
                 delay = duration.getSeconds() + duration.getNano() / 1e9;
             }
             trials.add(new PvtHistoryItem(row.getId(), row.getState(), row.getSenderMode(),
-                    row.getReceiverMode(), row.getTestStartedAt(), row.getReceivedAt(), delay,
-                    row.getClockWarning(), availability, "AVAILABLE".equals(availability) ? received : null));
+                    row.getReceiverMode(), row.getTestStartedAt(), row.getReceivedAt(), rf == null ? delay : rf.delaySeconds(),
+                    row.getClockWarning(), availability, "AVAILABLE".equals(availability) ? received : null,
+                    rf == null ? null : rf.baseline(), rf == null ? null : rf.clockDifferenceSeconds()));
         }
         return new PvtHistory(key, context.getTestType(), epoch, origin, rows.size(),
                 waiting, unavailable, trials);
@@ -1756,6 +1782,7 @@ public class DtnService {
                         if (rf) logs.pvt(job.getId(), "TEST", decoded.rfBaselinePvt(), 0, "RF 기준 PVT");
                         logs.pvt(job.getId(), "TEST", decoded.pvt(), 0, "I/Q 공통 지연 PVT");
                     }
+                    assignIqHistory(job, transfer.getFile().sha256(), decoded);
                     job.setReceiverJson(objectMapper.writeValueAsString(decoded.pvt()));
                     job.setObservationsJson(
                             objectMapper.writeValueAsString(decoded.observations()));

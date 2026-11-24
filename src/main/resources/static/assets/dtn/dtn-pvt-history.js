@@ -112,7 +112,7 @@ export function createPvtHistory({root, request, project, onSelect}) {
 
   function setJob(value) {
     job = value;
-    const nextKey = ['GNSS_RAW','AFS_METADATA'].includes(job?.testType) ? job?.pvtHistoryKey || null : null;
+    const nextKey = ['GNSS_RAW','AFS_METADATA','IQ_SAMPLE'].includes(job?.testType) ? job?.pvtHistoryKey || null : null;
     if (key !== nextKey) {
       version++;
       controller?.abort();
@@ -151,8 +151,9 @@ export function createPvtHistory({root, request, project, onSelect}) {
       if (stamp !== version || result.historyKey !== key) return;
       data = result;
       points = data.trials.flatMap((trial, index) => {
-        if (trial.availability !== 'AVAILABLE' || !trial.ecefMeters || !data.referenceEcefMeters) return [];
-        const enu = project(data.referenceEcefMeters, trial.ecefMeters);
+        const origin = trial.rfReferenceEcefMeters ?? data.referenceEcefMeters;
+        if (trial.availability !== 'AVAILABLE' || !trial.ecefMeters || !origin) return [];
+        const enu = project(origin, trial.ecefMeters);
         if (!enu || ![enu.e,enu.n,enu.u].every(Number.isFinite)) return [];
         return [{...trial, ...enu, number:index+1, h:Math.hypot(enu.e,enu.n), r:Math.hypot(enu.e,enu.n,enu.u)}];
       });
@@ -170,6 +171,7 @@ export function createPvtHistory({root, request, project, onSelect}) {
     return '#' + point.number + ' · ' + point.testId + ' · ' + time(point.startedAt)
       + ' · ' + point.senderMode + ' → ' + point.receiverMode
       + ' · 지연 ' + (Number.isFinite(point.delaySeconds) ? point.delaySeconds.toFixed(6) + ' s' : '—')
+      + (Number.isFinite(point.clockDifferenceSeconds) ? ' · Clock Bias 증가 ' + point.clockDifferenceSeconds.toFixed(9) + ' s' : '')
       + ' · E ' + historyDistance(point.e) + ' / N ' + historyDistance(point.n) + ' / U ' + historyDistance(point.u);
   }
 
@@ -184,8 +186,12 @@ export function createPvtHistory({root, request, project, onSelect}) {
     root.hidden = false;
     if (automatic && !expanded) radius = Math.max(radius, historyRadius(Math.max(0, ...points.map(p => p.h))));
     const epoch = data?.selectedEpoch || job?.selectedEpoch;
+    const iq = job?.testType === 'IQ_SAMPLE';
+    const title = header.querySelector('strong');
+    title.textContent = iq ? 'RF 기준 대비 위치 편차' : 'Reference 대비 위치 편차';
+    title.title = iq ? '각 회차의 지연 전 RF 위치 기준' : '송신 원본 PVT 기준 편차';
     find('pvt-history-context').textContent = [
-      job?.testType === 'GNSS_RAW' ? 'RAW' : 'AFS',
+      iq ? 'I/Q · 같은 샘플 파일' : job?.testType === 'GNSS_RAW' ? 'RAW' : 'AFS',
       epoch ? 'Week ' + epoch.week + ' / TOW ' + epoch.towSeconds + ' s' : '',
       '표시 ' + points.length + ' / 등록 ' + (data?.total ?? 0),
       '대기 ' + (data?.waiting ?? 0),

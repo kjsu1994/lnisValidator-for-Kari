@@ -238,6 +238,44 @@ class DtnSummaryIntegrationTest {
     }
 
     @Test
+    void iqHistoryGroupsVerifiedFilesAndUsesEachRoundsRfBaseline() throws Exception {
+        var service = service();
+        for (int i = 0; i < 4; i++) {
+            var job = job(i);
+            job.setTestType("IQ_SAMPLE");
+            job.setState("COMPLETED");
+            job.setReferenceStatus("WAITING");
+            job.setSenderMode(i == 0 ? "DTN" : "HDTN");
+            var baseline = new server.common.DtnModels.Pvt();
+            baseline.setPositionValid(true);
+            baseline.setEcefMeters(new double[]{6378137 + i, 0, 0});
+            baseline.setReceiverClockBiasSeconds(1.0);
+            var received = new server.common.DtnModels.Pvt();
+            received.setPositionValid(true);
+            received.setEcefMeters(new double[]{6378137 + i, 2, 0});
+            received.setReceiverClockBiasSeconds(1.25);
+            var evidence = new server.pvt.DtnDelay.Evidence(null, i == 2 ? -1 : i, 0, null, null,
+                    List.of(), i == 2 ? "negative delay" : null);
+            var result = new server.iq.IqReceiver.Result(List.of(received), Map.of(), evidence, List.of(baseline));
+            service.assignIqHistory(job, (i == 3 ? "B" : "A").repeat(64), result);
+            job.setReceiverJson(new ObjectMapper().writeValueAsString(result.pvt()));
+            jobs.save(job);
+        }
+        jobs.flush();
+        em.clear();
+        var history = service.pvtHistory(job(0).getId());
+        assertEquals(3, history.total());
+        assertEquals(1, history.unavailable());
+        var second = history.trials().get(1);
+        assertEquals("AVAILABLE", second.availability());
+        assertArrayEquals(new double[]{6378138, 0, 0}, second.rfReferenceEcefMeters());
+        assertArrayEquals(new double[]{6378138, 2, 0}, second.ecefMeters());
+        assertEquals(1.0, second.delaySeconds());
+        assertEquals(0.25, second.clockDifferenceSeconds());
+        assertNull(history.trials().get(2).ecefMeters());
+    }
+
+    @Test
     void historyReadsAllRoundsWithoutRawPayloadsAndKeepsInvalidResultsOutOfTheTarget() throws Exception {
         String key = "A".repeat(64);
         var saved = new ArrayList<DtnJob>();

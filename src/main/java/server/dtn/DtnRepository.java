@@ -175,6 +175,7 @@ public interface DtnRepository extends JpaRepository<DtnJob, UUID> {
         String getReferenceStatus();
         String getReferenceJson();
         String getReceiverJson();
+        String getIqHistoryJson();
         String getClockWarning();
     }
 
@@ -182,7 +183,7 @@ public interface DtnRepository extends JpaRepository<DtnJob, UUID> {
             select j.id as id, j.state as state, j.senderMode as senderMode,
                 j.receiverMode as receiverMode, j.testStartedAt as testStartedAt,
                 j.receivedAt as receivedAt, j.referenceStatus as referenceStatus,
-                j.referenceJson as referenceJson, j.receiverJson as receiverJson,
+                j.referenceJson as referenceJson, j.receiverJson as receiverJson, j.iqHistoryJson as iqHistoryJson,
                 j.clockWarning as clockWarning
             from DtnJob j where j.pvtHistoryKey = :key
             order by j.testStartedAt asc, j.id asc
